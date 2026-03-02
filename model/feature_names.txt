@@ -1,0 +1,17 @@
+hour_from_admission
+heart_rate
+respiratory_rate
+spo2_pct
+temperature_c
+systolic_bp
+diastolic_bp
+oxygen_flow
+mobility_score
+nurse_alert
+wbc_count
+lactate
+creatinine
+crp_level
+hemoglobin
+age
+comorbidity_index
