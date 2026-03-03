@@ -1,0 +1,40 @@
+# Core Data Processing & Analysis
+pandas>=1.3.0
+numpy>=1.21.0
+scipy>=1.7.0
+
+# Machine Learning & Model Training
+scikit-learn>=1.0.0
+xgboost>=1.5.0
+joblib>=1.1.0
+
+# Explainability & Interpretability
+shap>=0.41.0
+
+# Visualization
+matplotlib>=3.5.0
+seaborn>=0.11.0
+plotly>=5.0.0
+
+# Jupyter Notebook Support
+jupyter>=1.0.0
+ipython>=7.30.0
+ipywidgets>=7.6.0
+
+# Utilities
+python-dateutil>=2.8.2
+pytz>=2021.3
+
+# Optional: For better performance
+numba>=0.55.0
+
+# Optional: For statistical analysis
+statsmodels>=0.13.0
+
+# Development & Testing (optional)
+pytest>=6.2.0
+black>=22.0.0
+flake8>=4.0.0
+
+# Logging & Monitoring (optional)
+python-logging>=2.1.1
