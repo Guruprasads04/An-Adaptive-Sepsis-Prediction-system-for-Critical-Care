@@ -326,16 +326,16 @@ Optimal thresholds found via ROC analysis on validation set
 
 | Metric | Score |
 |--------|-------|
-| **Accuracy** | 87.2% |
-| **Precision** | 84.1% |
-| **Recall (Sensitivity)** | 81.5% |
-| **F1-Score** | 82.8% |
-| **ROC-AUC** | 0.9356 |
+| **Accuracy** | 89.25% |
+| **Precision** | 80.28% |
+| **Recall (Sensitivity)** | 78.29% |
+| **F1-Score** | 79.27% |
+| **ROC-AUC** | 0.9514 |
 
 **Interpretation:**
-- ✅ **81.5% sensitivity**: Catches 81.5% of patients who will develop sepsis
-- ✅ **84.1% precision**: When model alerts, it's correct 84% of the time
-- ✅ **0.936 AUC**: Excellent discrimination between sepsis/non-sepsis
+- ✅ **78.29% sensitivity**: Catches 78.29% of patients who will develop sepsis
+- ✅ **80.28% precision**: When model alerts, it's correct 80.28% of the time
+- ✅ **0.9514 AUC**: Excellent discrimination between sepsis/non-sepsis
 
 ### XGBoost Model
 
@@ -349,28 +349,28 @@ Optimal thresholds found via ROC analysis on validation set
 
 | Metric | Score |
 |--------|-------|
-| **Accuracy** | 87.8% |
-| **Precision** | 85.3% |
-| **Recall (Sensitivity)** | 82.2% |
-| **F1-Score** | 83.7% |
-| **ROC-AUC** | 0.9412 |
+| **Accuracy** | 88.59% |
+| **Precision** | 77.06% |
+| **Recall (Sensitivity)** | 80.52% |
+| **F1-Score** | 78.75% |
+| **ROC-AUC** | 0.9454 |
 
 **Comparison:**
-- 🟢 **XGBoost Accuracy**: +0.6% higher
-- 🟢 **XGBoost Precision**: +1.2% higher
-- 🟡 **Random Forest Recall**: Slightly higher catch rate
-- 🎯 **Recommendation**: XGBoost for production (better precision, faster inference)
+- 🟡 **XGBoost Accuracy**: -0.66% lower
+- 🔴 **XGBoost Precision**: -3.22% lower
+- 🟢 **XGBoost Recall**: +2.23% higher catch rate
+- 🎯 **Recommendation**: Random Forest for production (better precision & ROC-AUC, higher specificity)
 
 ### Model Selection Trade-offs
 
 | Aspect | Random Forest | XGBoost |
 |--------|---------------|---------|
-| Accuracy | 87.2% | **87.8%** ✅ |
-| Precision | 84.1% | **85.3%** ✅ |
-| Recall | **81.5%** ✅ | 82.2% |
-| ROC-AUC | 0.9356 | **0.9412** ✅ |
-| Training Time | 2-3 min | 1-2 min ✅ |
-| Inference Speed | 10-20 ms | **1-3 ms** ✅ |
+| Accuracy | **89.25%** ✅ | 88.59% |
+| Precision | **80.28%** ✅ | 77.06% |
+| Recall | 78.29% | **80.52%** ✅ |
+| ROC-AUC | **0.9514** ✅ | 0.9454 |
+| Specificity | **High** ✅ | Lower |
+| False Alarm Rate | **Lower** ✅ | Higher |
 | Interpretability | 🟢 Good | 🟡 Fair |
 | Hyperparameter Tuning | Simple | Complex |
 
@@ -575,10 +575,10 @@ jupyter notebook Sepsis_Model_Training.ipynb
 - ✅ Designed with ICU clinician input
 
 ### 2. **Predictive Performance**
-- ✅ **87.8% Accuracy** on unseen test data
-- ✅ **85.3% Precision** - reliable clinical alerts
-- ✅ **82.2% Sensitivity** - catches most at-risk patients
-- ✅ **0.941 ROC-AUC** - excellent discrimination
+- ✅ **89.25% Accuracy** on unseen test data (Random Forest)
+- ✅ **80.28% Precision** - highly reliable clinical alerts with minimal false alarms
+- ✅ **78.29% Sensitivity** - catches majority of at-risk patients
+- ✅ **0.9514 ROC-AUC** - excellent discrimination between sepsis/non-sepsis
 
 ### 3. **Explainability**
 - ✅ **SHAP-based interpretations** - understand each prediction
