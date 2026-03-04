@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  # FastAPI Application
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sepsis-api
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./model:/app/model
+      - ./src:/app/src
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - sepsis-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # PostgreSQL Database (Optional)
+  # db:
+  #   image: postgres:15-alpine
+  #   container_name: sepsis-db
+  #   environment:
+  #     POSTGRES_USER: sepsis_user
+  #     POSTGRES_PASSWORD: sepsis_password
+  #     POSTGRES_DB: sepsis_predictions
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   networks:
+  #     - sepsis-network
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U sepsis_user"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+  # Redis Cache (Optional)
+  # cache:
+  #   image: redis:7-alpine
+  #   container_name: sepsis-cache
+  #   ports:
+  #     - "6379:6379"
+  #   networks:
+  #     - sepsis-network
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+networks:
+  sepsis-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+
+# Commands:
+# Build and start: docker-compose up -d
+# View logs: docker-compose logs -f api
+# Stop: docker-compose down
+# Rebuild: docker-compose up -d --build
