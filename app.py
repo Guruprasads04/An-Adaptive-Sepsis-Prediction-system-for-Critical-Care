@@ -21,12 +21,12 @@ Date: March 2026
 from fastapi import FastAPI, HTTPException, status, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
 from typing import List, Dict, Optional, Literal
 from datetime import datetime
 import joblib
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 import json
 import os
 from pathlib import Path
@@ -118,8 +118,8 @@ class PatientVitals(BaseModel):
     diastolic_bp: float = Field(..., gt=0, description="Diastolic BP in mmHg")
     hemoglobin: float = Field(..., gt=0, description="Hemoglobin in g/dL")
 
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "lactate": 1.5,
                 "wbc_count": 8.5,
@@ -134,14 +134,17 @@ class PatientVitals(BaseModel):
                 "hemoglobin": 14.0
             }
         }
+    )
 
-    @validator('temperature')
+    @field_validator('temperature')
+    @classmethod
     def validate_temperature(cls, v):
         if v < 30 or v > 45:
             raise ValueError('Temperature must be between 30-45 °C')
         return v
 
-    @validator('spo2')
+    @field_validator('spo2')
+    @classmethod
     def validate_spo2(cls, v):
         if v < 50 or v > 100:
             raise ValueError('SpO2 must be between 50-100%')
@@ -281,7 +284,7 @@ def validate_vitals(vitals: PatientVitals) -> ValidationResponse:
     abnormal_values = []
     warnings = []
     
-    vitals_dict = vitals.dict()
+    vitals_dict = vitals.model_dump()
     
     for param, value in vitals_dict.items():
         if param in NORMAL_RANGES:
@@ -338,7 +341,7 @@ def get_recommendation(risk_level: str, sirs_positive: bool) -> str:
 
 def prepare_features(vitals: PatientVitals, feature_names: List[str]) -> np.ndarray:
     """Prepare features for model prediction"""
-    vitals_dict = vitals.dict()
+    vitals_dict = vitals.model_dump()
     
     # Create feature vector in correct order
     feature_vector = []
@@ -360,7 +363,7 @@ Key Clinical Parameters:
 """
     
     for feature, importance in list(top_features.items())[:3]:
-        value = vitals.dict().get(feature.lower().replace('_', ''), 'N/A')
+        value = vitals.model_dump().get(feature.lower().replace('_', ''), 'N/A')
         normal = NORMAL_RANGES.get(feature.lower().replace('_', ''), {})
         explanation += f"\n- {feature}: {value} {normal.get('unit', '')} (Impact: {importance:.1%})"
     
@@ -596,7 +599,7 @@ async def explain_prediction(patient: PatientInput):
         prediction = await predict_sepsis(patient, "xgboost")
         
         # Simulate top features (in production, use actual SHAP values)
-        vitals_dict = patient.dict()
+        vitals_dict = patient.model_dump()
         feature_importance = {}
         
         # Calculate simplified feature importance based on deviation from normal
@@ -817,8 +820,8 @@ async def list_features():
         "total_features": len(feature_names),
         "features": feature_names,
         "feature_descriptions": {
-            field_name: field.field_info.description
-            for field_name, field in PatientVitals.__fields__.items()
+            field_name: field.description
+            for field_name, field in PatientVitals.model_fields.items()
         }
     }
 
