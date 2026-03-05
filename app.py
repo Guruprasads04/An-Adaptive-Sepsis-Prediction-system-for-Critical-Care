@@ -106,17 +106,25 @@ MODEL_CONFIG = {
 class PatientVitals(BaseModel):
     """Patient vital signs and lab values for prediction"""
     
+    # Core vitals (required)
     lactate: float = Field(..., gt=0, description="Lactate level in mmol/L")
     wbc_count: float = Field(..., gt=0, description="WBC count in x10^9/L")
     crp_level: float = Field(..., ge=0, description="CRP level in mg/L")
     creatinine: float = Field(..., gt=0, description="Creatinine in mg/dL")
     heart_rate: float = Field(..., gt=0, description="Heart rate in bpm")
     respiratory_rate: float = Field(..., gt=0, description="Respiratory rate /min")
-    temperature: float = Field(..., description="Temperature in °C")
-    spo2: float = Field(..., ge=0, le=100, description="SpO2 percentage")
+    temperature: float = Field(..., description="Temperature in °C (mapped to temperature_c)")
+    spo2: float = Field(..., ge=0, le=100, description="SpO2 percentage (mapped to spo2_pct)")
     systolic_bp: float = Field(..., gt=0, description="Systolic BP in mmHg")
     diastolic_bp: float = Field(..., gt=0, description="Diastolic BP in mmHg")
     hemoglobin: float = Field(..., gt=0, description="Hemoglobin in g/dL")
+    
+    # Additional model features (optional with defaults)
+    hour_from_admission: float = Field(0, ge=0, description="Hours since admission")
+    oxygen_flow: float = Field(0, ge=0, description="Oxygen flow rate in L/min")
+    mobility_score: float = Field(5, ge=0, le=10, description="Mobility score (0-10)")
+    nurse_alert: int = Field(0, ge=0, le=1, description="Nurse alert flag (0 or 1)")
+    comorbidity_index: float = Field(0, ge=0, description="Comorbidity index score")
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -131,7 +139,12 @@ class PatientVitals(BaseModel):
                 "spo2": 96,
                 "systolic_bp": 120,
                 "diastolic_bp": 80,
-                "hemoglobin": 14.0
+                "hemoglobin": 14.0,
+                "hour_from_admission": 12,
+                "oxygen_flow": 2.0,
+                "mobility_score": 5,
+                "nurse_alert": 0,
+                "comorbidity_index": 1.5
             }
         }
     )
@@ -154,8 +167,10 @@ class PatientVitals(BaseModel):
 class PatientInput(PatientVitals):
     """Patient data with demographic info"""
     patient_id: str = Field(..., description="Unique patient identifier")
-    age: Optional[int] = Field(None, ge=0, le=120, description="Patient age")
-    gender: Optional[Literal["M", "F", "Other"]] = Field(None, description="Patient gender")
+    age: Optional[int] = Field(50, ge=0, le=120, description="Patient age (default: 50)")
+    gender: Optional[Literal["M", "F", "Other"]] = Field("M", description="Patient gender")
+    admission_type: Optional[Literal["Emergency", "Elective", "Transfer"]] = Field("Emergency", description="Admission type")
+    oxygen_device: Optional[Literal["none", "nasal", "mask", "niv"]] = Field("none", description="Oxygen delivery device")
     notes: Optional[str] = Field(None, description="Clinical notes")
 
 
@@ -234,18 +249,24 @@ def load_model(model_name: str = "xgboost"):
         return None
 
 
-def load_feature_names():
-    """Load feature names for the model"""
+def load_feature_names(model_name: str = "xgboost"):
+    """Load feature names for the specified model by reading from the saved model"""
     try:
+        model_path = MODEL_CONFIG.get(model_name, {}).get("path", "")
+        if os.path.exists(model_path):
+            model = joblib.load(model_path)
+            if hasattr(model, 'feature_names_in_'):
+                return list(model.feature_names_in_)
+        
+        # Fallback to feature_names.txt
         feature_path = "model/feature_names.txt"
         if os.path.exists(feature_path):
             with open(feature_path, 'r') as f:
-                feature_names = [line.strip() for line in f.readlines()]
-            return feature_names
-        return list(PatientVitals.__fields__.keys())
+                return [line.strip() for line in f.readlines()]
+        return list(PatientVitals.model_fields.keys())
     except Exception as e:
-        logger.error(f"Error loading features: {e}")
-        return list(PatientVitals.__fields__.keys())
+        logger.error(f"Error loading features for {model_name}: {e}")
+        return list(PatientVitals.model_fields.keys())
 
 
 def calculate_sirs_score(vitals: PatientVitals) -> tuple:
@@ -339,15 +360,69 @@ def get_recommendation(risk_level: str, sirs_positive: bool) -> str:
     return base_rec
 
 
-def prepare_features(vitals: PatientVitals, feature_names: List[str]) -> np.ndarray:
-    """Prepare features for model prediction"""
+# Mapping from model feature names to API field names
+FEATURE_NAME_MAP = {
+    "temperature_c": "temperature",
+    "spo2_pct": "spo2",
+}
+
+
+def prepare_features(vitals, feature_names: List[str]) -> np.ndarray:
+    """Prepare features for model prediction.
+    Handles both XGBoost (17 features) and Random Forest (26 features).
+    Derives one-hot encoded categoricals and SIRS features automatically.
+    """
     vitals_dict = vitals.model_dump()
     
-    # Create feature vector in correct order
+    # Ensure age has a value
+    if vitals_dict.get('age') is None:
+        vitals_dict['age'] = 50
+    
+    # Calculate SIRS-derived features
+    temp = vitals_dict.get('temperature', 37.0)
+    hr = vitals_dict.get('heart_rate', 75)
+    rr = vitals_dict.get('respiratory_rate', 16)
+    wbc = vitals_dict.get('wbc_count', 7.0)
+    
+    sirs_temp = int(temp > 38 or temp < 36)
+    sirs_hr = int(hr > 90)
+    sirs_rr = int(rr > 20)
+    sirs_wbc = int(wbc > 12 or wbc < 4)
+    sirs_score_val = sirs_temp + sirs_hr + sirs_rr + sirs_wbc
+    sirs_positive_val = int(sirs_score_val >= 2)
+    
+    # One-hot encoded: oxygen_device
+    oxygen_device = vitals_dict.get('oxygen_device', 'none') or 'none'
+    vitals_dict['oxygen_device_mask'] = int(oxygen_device == 'mask')
+    vitals_dict['oxygen_device_nasal'] = int(oxygen_device == 'nasal')
+    vitals_dict['oxygen_device_niv'] = int(oxygen_device == 'niv')
+    vitals_dict['oxygen_device_none'] = int(oxygen_device == 'none')
+    
+    # One-hot encoded: gender (baseline = F)
+    gender = vitals_dict.get('gender', 'M') or 'M'
+    vitals_dict['gender_M'] = int(gender == 'M')
+    
+    # One-hot encoded: admission_type (baseline = Emergency)
+    admission = vitals_dict.get('admission_type', 'Emergency') or 'Emergency'
+    vitals_dict['admission_type_Elective'] = int(admission == 'Elective')
+    vitals_dict['admission_type_Transfer'] = int(admission == 'Transfer')
+    
+    # SIRS derived
+    vitals_dict['sirs_score'] = sirs_score_val
+    vitals_dict['sirs_positive'] = sirs_positive_val
+    
+    # Build feature vector in correct order
     feature_vector = []
     for feature in feature_names:
         if feature in vitals_dict:
-            feature_vector.append(vitals_dict[feature])
+            feature_vector.append(float(vitals_dict[feature]))
+        elif feature in FEATURE_NAME_MAP and FEATURE_NAME_MAP[feature] in vitals_dict:
+            feature_vector.append(float(vitals_dict[FEATURE_NAME_MAP[feature]]))
+        else:
+            feature_vector.append(0.0)
+    
+    if len(feature_vector) != len(feature_names):
+        raise ValueError(f"Feature shape mismatch, expected: {len(feature_names)}, got {len(feature_vector)}")
     
     return np.array(feature_vector).reshape(1, -1)
 
@@ -495,7 +570,7 @@ async def predict_sepsis(patient: PatientInput, model_name: str = "xgboost"):
                 detail=f"Model {model_name} not available"
             )
         
-        feature_names = load_feature_names()
+        feature_names = load_feature_names(model_name)
         features = prepare_features(patient, feature_names)
         
         # Generate prediction
@@ -560,26 +635,42 @@ async def predict_batch(request: BatchPredictionRequest):
 @app.post("/risk-stratification", tags=["Predictions"])
 async def risk_stratification(patient: PatientInput):
     """
-    Comprehensive risk stratification for patient
+    Comprehensive risk stratification using BOTH models for consensus.
+    Uses XGBoost as primary and Random Forest as secondary for validation.
     """
     try:
-        prediction = await predict_sepsis(patient, "xgboost")
+        # Run both models for robust risk assessment
+        xgb_prediction = await predict_sepsis(patient, "xgboost")
+        rf_prediction = await predict_sepsis(patient, "random_forest")
+        
+        # Ensemble: average both scores for more stable prediction
+        ensemble_score = (xgb_prediction.risk_score + rf_prediction.risk_score) / 2
+        ensemble_level = classify_risk_level(ensemble_score)
+        
+        # Check if models agree
+        models_agree = xgb_prediction.risk_level == rf_prediction.risk_level
         
         return {
             "patient_id": patient.patient_id,
             "risk_stratification": {
-                "category": prediction.risk_level,
-                "score": prediction.risk_score,
-                "recommendation": prediction.recommendation,
+                "category": ensemble_level,
+                "ensemble_score": round(ensemble_score, 4),
+                "recommendation": get_recommendation(ensemble_level, xgb_prediction.sirs_info.sirs_positive),
                 "monitoring_frequency": {
                     "LOW": "Every 8-12 hours",
                     "MODERATE": "Every 4-6 hours",
                     "HIGH": "Every 2-4 hours",
                     "CRITICAL": "Continuous monitoring"
-                }[prediction.risk_level]
+                }[ensemble_level]
             },
-            "sirs_status": prediction.sirs_info,
-            "timestamp": prediction.timestamp
+            "model_details": {
+                "xgboost": {"score": xgb_prediction.risk_score, "level": xgb_prediction.risk_level},
+                "random_forest": {"score": rf_prediction.risk_score, "level": rf_prediction.risk_level},
+                "models_agree": models_agree,
+                "confidence": "HIGH" if models_agree else "MODERATE - models disagree, review recommended"
+            },
+            "sirs_status": xgb_prediction.sirs_info,
+            "timestamp": xgb_prediction.timestamp
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -590,13 +681,14 @@ async def risk_stratification(patient: PatientInput):
 # ============================================================================
 
 @app.post("/explain", response_model=ExplanationResponse, tags=["Explainability"])
-async def explain_prediction(patient: PatientInput):
+async def explain_prediction(patient: PatientInput, model_name: str = "xgboost"):
     """
-    Provide SHAP-based explanation for prediction
+    Provide SHAP-based explanation for prediction.
+    Supports both 'xgboost' and 'random_forest' models.
     """
     try:
         # Get prediction first
-        prediction = await predict_sepsis(patient, "xgboost")
+        prediction = await predict_sepsis(patient, model_name)
         
         # Simulate top features (in production, use actual SHAP values)
         vitals_dict = patient.model_dump()
@@ -632,12 +724,13 @@ async def explain_prediction(patient: PatientInput):
 
 
 @app.post("/explain-doctor", tags=["Explainability"])
-async def explain_doctor(patient: PatientInput):
-    """Doctor-friendly explanation"""
+async def explain_doctor(patient: PatientInput, model_name: str = "xgboost"):
+    """Doctor-friendly explanation. Supports 'xgboost' or 'random_forest'."""
     try:
-        explanation = await explain_prediction(patient)
+        explanation = await explain_prediction(patient, model_name)
         return {
             "patient_id": patient.patient_id,
+            "model_used": model_name,
             "clinical_assessment": explanation.doctor_explanation,
             "key_findings": explanation.top_features,
             "timestamp": datetime.now().isoformat()
@@ -647,12 +740,13 @@ async def explain_doctor(patient: PatientInput):
 
 
 @app.post("/explain-patient", tags=["Explainability"])
-async def explain_patient(patient: PatientInput):
-    """Patient-friendly explanation"""
+async def explain_patient(patient: PatientInput, model_name: str = "random_forest"):
+    """Patient-friendly explanation. Defaults to Random Forest (simpler model)."""
     try:
-        explanation = await explain_prediction(patient)
+        explanation = await explain_prediction(patient, model_name)
         return {
             "patient_id": patient.patient_id,
+            "model_used": model_name,
             "simple_explanation": explanation.patient_explanation,
             "timestamp": datetime.now().isoformat()
         }
@@ -812,17 +906,19 @@ async def get_normal_ranges():
 # ============================================================================
 
 @app.get("/features", tags=["Features"])
-async def list_features():
-    """List all features used by the model"""
-    feature_names = load_feature_names()
+async def list_features(model_name: str = "xgboost"):
+    """List all features used by the specified model"""
+    feature_names = load_feature_names(model_name)
     
     return {
+        "model": model_name,
         "total_features": len(feature_names),
         "features": feature_names,
-        "feature_descriptions": {
+        "input_fields": {
             field_name: field.description
             for field_name, field in PatientVitals.model_fields.items()
-        }
+        },
+        "note": "Random Forest uses 26 features (incl. one-hot encoded categoricals + SIRS). XGBoost uses 17 numeric features."
     }
 
 
@@ -888,14 +984,58 @@ async def patient_time_series(patient_id: str, hours: int = 24):
 # 10. PATIENT HISTORY ROUTES
 # ============================================================================
 
-@app.post("/patient/{patient_id}/predictions", tags=["Patient Data"])
-async def add_patient_prediction(patient_id: str, patient: PatientInput):
-    """Log prediction for a specific patient"""
+@app.post("/compare", tags=["Predictions"])
+async def compare_models(patient: PatientInput):
+    """
+    Compare predictions from BOTH Random Forest and XGBoost side-by-side.
+    Returns predictions from both models with a recommendation on which to trust.
+    """
     try:
-        prediction = await predict_sepsis(patient, "xgboost")
+        rf_pred = await predict_sepsis(patient, "random_forest")
+        xgb_pred = await predict_sepsis(patient, "xgboost")
+        
+        score_diff = abs(xgb_pred.risk_score - rf_pred.risk_score)
+        
+        if score_diff < 0.1:
+            agreement = "STRONG - Both models agree closely"
+        elif score_diff < 0.2:
+            agreement = "MODERATE - Minor differences between models"
+        else:
+            agreement = "WEAK - Significant disagreement, clinical review recommended"
+        
+        return {
+            "patient_id": patient.patient_id,
+            "random_forest": {
+                "risk_score": rf_pred.risk_score,
+                "risk_level": rf_pred.risk_level,
+                "recommendation": rf_pred.recommendation
+            },
+            "xgboost": {
+                "risk_score": xgb_pred.risk_score,
+                "risk_level": xgb_pred.risk_level,
+                "recommendation": xgb_pred.recommendation
+            },
+            "ensemble": {
+                "average_score": round((rf_pred.risk_score + xgb_pred.risk_score) / 2, 4),
+                "max_score": round(max(rf_pred.risk_score, xgb_pred.risk_score), 4),
+                "agreement": agreement
+            },
+            "sirs_info": rf_pred.sirs_info,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/patient/{patient_id}/predictions", tags=["Patient Data"])
+async def add_patient_prediction(patient_id: str, patient: PatientInput, model_name: str = "xgboost"):
+    """Log prediction for a specific patient. Supports 'xgboost' or 'random_forest'."""
+    try:
+        prediction = await predict_sepsis(patient, model_name)
         return {
             "message": "Prediction logged",
             "patient_id": patient_id,
+            "model_used": model_name,
             "prediction": prediction,
             "timestamp": datetime.now().isoformat()
         }
