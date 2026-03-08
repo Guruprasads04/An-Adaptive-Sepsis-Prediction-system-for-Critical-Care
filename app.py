@@ -217,6 +217,61 @@ class ExplanationResponse(BaseModel):
     shap_values: Optional[Dict] = None
 
 
+class EnsemblePredictionResponse(BaseModel):
+    """Ensemble prediction combining both models"""
+    patient_id: Optional[str]
+    rf_probability: float = Field(..., ge=0, le=1)
+    xgb_probability: float = Field(..., ge=0, le=1)
+    ensemble_probability: float = Field(..., ge=0, le=1)
+    ensemble_risk_level: Literal["LOW", "MODERATE", "HIGH", "CRITICAL"]
+    rf_weight: float = Field(..., ge=0, le=1)
+    xgb_weight: float = Field(..., ge=0, le=1)
+    model_agreement: Literal["STRONG", "MODERATE", "WEAK"]
+    sirs_info: SIRSResponse
+    recommendation: str
+    timestamp: str
+
+
+class DisagreementAlert(BaseModel):
+    """Alert when models disagree on patient risk"""
+    patient_id: Optional[str]
+    alert_level: Literal["NONE", "ADVISORY", "WARNING", "CRITICAL_REVIEW"]
+    rf_prediction: Dict
+    xgb_prediction: Dict
+    disagreement_score: float = Field(..., ge=0, description="Magnitude of disagreement")
+    disagreement_type: str
+    clinical_action: str
+    flagged_for_review: bool
+    timestamp: str
+
+
+class TimeSeriesPoint(BaseModel):
+    """A single point in the time-series monitoring"""
+    timestamp: str
+    rf_risk_score: float
+    xgb_risk_score: float
+    ensemble_score: float
+    risk_level: str
+    alert_triggered: bool
+    alert_message: Optional[str] = None
+
+
+class ConfidenceRoutingResponse(BaseModel):
+    """Response from confidence-based model routing"""
+    patient_id: Optional[str]
+    routing_decision: Literal["RF_ONLY", "XGB_ONLY", "ENSEMBLE"]
+    routing_reason: str
+    primary_probability: float
+    final_probability: float
+    final_risk_level: Literal["LOW", "MODERATE", "HIGH", "CRITICAL"]
+    rf_probability: float
+    xgb_probability: float
+    confidence_score: float = Field(..., ge=0, le=1)
+    recommendation: str
+    sirs_info: SIRSResponse
+    timestamp: str
+
+
 class PatientHistory(BaseModel):
     """Patient prediction history"""
     patient_id: str
@@ -515,13 +570,18 @@ async def root():
     """Welcome endpoint"""
     return {
         "message": "Sepsis Prediction API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "status": "healthy",
         "endpoints": {
             "documentation": "/docs",
             "health_check": "/health",
             "predict": "/predict",
-            "explain": "/explain"
+            "predict_ensemble": "/predict-ensemble",
+            "predict_smart": "/predict-smart (confidence-based routing)",
+            "disagreement_alert": "/disagreement-alert",
+            "time_series": "/analytics/time-series/{patient_id}",
+            "explain": "/explain",
+            "compare": "/compare"
         }
     }
 
@@ -673,6 +733,245 @@ async def risk_stratification(patient: PatientInput):
             "timestamp": xgb_prediction.timestamp
         }
     except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ============================================================================
+# 2b. ENSEMBLE, DISAGREEMENT, CONFIDENCE ROUTING
+# ============================================================================
+
+@app.post("/predict-ensemble", response_model=EnsemblePredictionResponse, tags=["Ensemble & Smart Routing"])
+async def predict_ensemble(
+    patient: PatientInput,
+    rf_weight: float = 0.4,
+    xgb_weight: float = 0.6
+):
+    """
+    **Ensemble Voting Prediction** - Combines Random Forest and XGBoost
+    predictions using weighted averaging for higher reliability.
+
+    - `rf_weight`: Weight for Random Forest (default: 0.4)
+    - `xgb_weight`: Weight for XGBoost (default: 0.6)
+
+    The ensemble probability = (rf_weight * RF_prob) + (xgb_weight * XGB_prob)
+    """
+    try:
+        # Normalize weights
+        total_weight = rf_weight + xgb_weight
+        rf_w = rf_weight / total_weight
+        xgb_w = xgb_weight / total_weight
+
+        # Run both models
+        rf_pred = await predict_sepsis(patient, "random_forest")
+        xgb_pred = await predict_sepsis(patient, "xgboost")
+
+        # Weighted ensemble
+        ensemble_prob = rf_w * rf_pred.risk_score + xgb_w * xgb_pred.risk_score
+        ensemble_level = classify_risk_level(ensemble_prob)
+
+        # Measure agreement
+        score_diff = abs(rf_pred.risk_score - xgb_pred.risk_score)
+        if score_diff < 0.10:
+            agreement = "STRONG"
+        elif score_diff < 0.20:
+            agreement = "MODERATE"
+        else:
+            agreement = "WEAK"
+
+        recommendation = get_recommendation(ensemble_level, rf_pred.sirs_info.sirs_positive)
+        if agreement == "WEAK":
+            recommendation += " NOTE: Models show significant disagreement — clinical review advised."
+
+        return EnsemblePredictionResponse(
+            patient_id=patient.patient_id,
+            rf_probability=round(rf_pred.risk_score, 4),
+            xgb_probability=round(xgb_pred.risk_score, 4),
+            ensemble_probability=round(ensemble_prob, 4),
+            ensemble_risk_level=ensemble_level,
+            rf_weight=round(rf_w, 2),
+            xgb_weight=round(xgb_w, 2),
+            model_agreement=agreement,
+            sirs_info=rf_pred.sirs_info,
+            recommendation=recommendation,
+            timestamp=datetime.now().isoformat()
+        )
+    except Exception as e:
+        logger.error(f"Ensemble prediction error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/predict-ensemble/batch", tags=["Ensemble & Smart Routing"])
+async def predict_ensemble_batch(
+    request: BatchPredictionRequest,
+    rf_weight: float = 0.4,
+    xgb_weight: float = 0.6
+):
+    """
+    Batch ensemble predictions for multiple patients.
+    """
+    results = []
+    for patient_data in request.patients:
+        try:
+            p = PatientInput(**patient_data)
+            result = await predict_ensemble(p, rf_weight, xgb_weight)
+            results.append(result)
+        except Exception as e:
+            results.append({"error": str(e), "patient_id": patient_data.get("patient_id")})
+
+    return {
+        "total": len(request.patients),
+        "successful": len([r for r in results if isinstance(r, EnsemblePredictionResponse)]),
+        "predictions": results
+    }
+
+
+@app.post("/disagreement-alert", response_model=DisagreementAlert, tags=["Ensemble & Smart Routing"])
+async def disagreement_alert(patient: PatientInput):
+    """
+    **Disagreement Alerting** - Detects when Random Forest and XGBoost disagree
+    on a patient's risk, and flags the case for manual clinical review.
+
+    Alert Levels:
+    - `NONE`: Models agree (difference < 0.10)
+    - `ADVISORY`: Minor divergence (0.10 - 0.20)
+    - `WARNING`: Significant divergence (0.20 - 0.35)
+    - `CRITICAL_REVIEW`: Major divergence (> 0.35) or opposite risk categories
+    """
+    try:
+        rf_pred = await predict_sepsis(patient, "random_forest")
+        xgb_pred = await predict_sepsis(patient, "xgboost")
+
+        score_diff = abs(rf_pred.risk_score - xgb_pred.risk_score)
+        level_differs = rf_pred.risk_level != xgb_pred.risk_level
+
+        # Determine which model says higher risk
+        if rf_pred.risk_score > xgb_pred.risk_score:
+            higher_model, lower_model = "Random Forest", "XGBoost"
+        else:
+            higher_model, lower_model = "XGBoost", "Random Forest"
+
+        # Classify the type of disagreement
+        risk_order = {"LOW": 0, "MODERATE": 1, "HIGH": 2, "CRITICAL": 3}
+        level_gap = abs(risk_order[rf_pred.risk_level] - risk_order[xgb_pred.risk_level])
+
+        # Determine alert level
+        if score_diff < 0.10 and not level_differs:
+            alert_level = "NONE"
+            disagreement_type = "Models agree"
+            clinical_action = "No action needed. Both models converge on the same assessment."
+            flagged = False
+        elif score_diff < 0.20:
+            alert_level = "ADVISORY"
+            disagreement_type = f"Minor divergence — {higher_model} rates higher risk"
+            clinical_action = "Low concern. Monitor patient as per the higher-risk model's recommendation."
+            flagged = False
+        elif score_diff < 0.35:
+            alert_level = "WARNING"
+            disagreement_type = f"Significant divergence — {higher_model} ({rf_pred.risk_level if higher_model == 'Random Forest' else xgb_pred.risk_level}) vs {lower_model} ({xgb_pred.risk_level if higher_model == 'Random Forest' else rf_pred.risk_level})"
+            clinical_action = "FLAGGED: Recommend physician review. Use the higher-risk assessment until reviewed."
+            flagged = True
+        else:
+            alert_level = "CRITICAL_REVIEW"
+            disagreement_type = f"Major divergence — {higher_model} ({rf_pred.risk_level if higher_model == 'Random Forest' else xgb_pred.risk_level}) vs {lower_model} ({xgb_pred.risk_level if higher_model == 'Random Forest' else rf_pred.risk_level})"
+            clinical_action = "URGENT: Major model disagreement. Mandatory physician review. Treat as higher-risk until resolved."
+            flagged = True
+
+        # Escalate if risk levels differ by 2+ categories
+        if level_gap >= 2 and alert_level != "CRITICAL_REVIEW":
+            alert_level = "CRITICAL_REVIEW"
+            clinical_action = "URGENT: Models disagree by 2+ risk categories. Mandatory clinical review required."
+            flagged = True
+
+        return DisagreementAlert(
+            patient_id=patient.patient_id,
+            alert_level=alert_level,
+            rf_prediction={
+                "risk_score": round(rf_pred.risk_score, 4),
+                "risk_level": rf_pred.risk_level,
+                "recommendation": rf_pred.recommendation
+            },
+            xgb_prediction={
+                "risk_score": round(xgb_pred.risk_score, 4),
+                "risk_level": xgb_pred.risk_level,
+                "recommendation": xgb_pred.recommendation
+            },
+            disagreement_score=round(score_diff, 4),
+            disagreement_type=disagreement_type,
+            clinical_action=clinical_action,
+            flagged_for_review=flagged,
+            timestamp=datetime.now().isoformat()
+        )
+    except Exception as e:
+        logger.error(f"Disagreement alert error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/predict-smart", response_model=ConfidenceRoutingResponse, tags=["Ensemble & Smart Routing"])
+async def predict_smart(patient: PatientInput, confidence_threshold: float = 0.15):
+    """
+    **Confidence-Based Routing** - Intelligently selects the best prediction strategy:
+
+    1. Runs **Random Forest** first as the primary model.
+    2. If RF confidence is **high** (probability far from 0.5) AND XGBoost agrees → use RF result.
+    3. If RF confidence is **low** (probability near 0.5) → escalate to **ensemble** (both models).
+    4. If models **disagree** on risk category → use ensemble with a clinical review flag.
+
+    `confidence_threshold`: How far from 0.5 the RF probability must be to count as
+    "confident" (default: 0.15, meaning < 0.35 or > 0.65 is confident).
+    """
+    try:
+        # Step 1: Run RF as primary
+        rf_pred = await predict_sepsis(patient, "random_forest")
+        rf_prob = rf_pred.risk_score
+        rf_confidence = abs(rf_prob - 0.5) * 2  # Scale 0-1 (0 = uncertain, 1 = very sure)
+
+        # Step 2: Run XGBoost for comparison
+        xgb_pred = await predict_sepsis(patient, "xgboost")
+        xgb_prob = xgb_pred.risk_score
+
+        models_agree = rf_pred.risk_level == xgb_pred.risk_level
+        rf_is_confident = abs(rf_prob - 0.5) >= confidence_threshold
+
+        # Routing logic
+        if rf_is_confident and models_agree:
+            # Both agree and RF is confident → trust RF
+            routing = "RF_ONLY"
+            reason = f"RF confident ({rf_confidence:.0%}) and both models agree on {rf_pred.risk_level}."
+            final_prob = rf_prob
+        elif not rf_is_confident:
+            # RF uncertain → escalate to ensemble
+            routing = "ENSEMBLE"
+            reason = f"RF uncertain (confidence {rf_confidence:.0%}, prob={rf_prob:.3f} near 0.5). Escalated to ensemble."
+            final_prob = 0.4 * rf_prob + 0.6 * xgb_prob
+        else:
+            # RF confident but models disagree → ensemble with flag
+            routing = "ENSEMBLE"
+            reason = f"Models disagree (RF={rf_pred.risk_level}, XGB={xgb_pred.risk_level}). Using ensemble for safety."
+            final_prob = 0.4 * rf_prob + 0.6 * xgb_prob
+
+        final_level = classify_risk_level(final_prob)
+        confidence_out = max(rf_confidence, abs(final_prob - 0.5) * 2)
+
+        rec = get_recommendation(final_level, rf_pred.sirs_info.sirs_positive)
+        if routing == "ENSEMBLE" and not models_agree:
+            rec += " ⚠️ Models disagreed — physician review recommended."
+
+        return ConfidenceRoutingResponse(
+            patient_id=patient.patient_id,
+            routing_decision=routing,
+            routing_reason=reason,
+            primary_probability=round(rf_prob, 4),
+            final_probability=round(final_prob, 4),
+            final_risk_level=final_level,
+            rf_probability=round(rf_prob, 4),
+            xgb_probability=round(xgb_prob, 4),
+            confidence_score=round(confidence_out, 4),
+            recommendation=rec,
+            sirs_info=rf_pred.sirs_info,
+            timestamp=datetime.now().isoformat()
+        )
+    except Exception as e:
+        logger.error(f"Smart routing error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -957,26 +1256,93 @@ async def analytics_summary():
 
 @app.get("/analytics/time-series/{patient_id}", tags=["Analytics"])
 async def patient_time_series(patient_id: str, hours: int = 24):
-    """Risk score time series data for a patient"""
-    # Simulate time series data
+    """
+    **Enhanced Time-Series Monitoring Dashboard**
+
+    Simulates hourly monitoring using:
+    - **Random Forest** for trend analysis (stable hourly tracking)
+    - **XGBoost** for real-time anomaly/alert detection
+
+    Each data point includes both model scores, an ensemble score,
+    and an alert flag when XGBoost detects a sudden spike.
+    """
     import random
-    
-    timestamps = []
-    risk_scores = []
-    base_score = random.uniform(0.3, 0.7)
-    
+
+    random.seed(hash(patient_id) % 2**32)  # Deterministic per patient
+
+    data_points: List[Dict] = []
+    rf_base = random.uniform(0.25, 0.55)
+    xgb_base = rf_base + random.uniform(-0.05, 0.05)
+
+    alerts: List[Dict] = []
+    trend_scores = []
+
     for h in range(hours, 0, -1):
-        timestamps.append(f"-{h}h")
-        risk_scores.append(base_score + random.uniform(-0.1, 0.1))
-    
+        # RF: smooth trend (small drift)
+        rf_drift = random.gauss(0, 0.02)
+        rf_base = max(0.05, min(0.95, rf_base + rf_drift))
+
+        # XGBoost: more reactive (can spike)
+        xgb_drift = random.gauss(0, 0.04)
+        # Occasional anomaly spike (10% chance)
+        if random.random() < 0.10:
+            xgb_drift += random.uniform(0.10, 0.25)
+        xgb_base = max(0.05, min(0.95, xgb_base + xgb_drift))
+
+        ensemble = 0.4 * rf_base + 0.6 * xgb_base
+        level = classify_risk_level(ensemble)
+        trend_scores.append(ensemble)
+
+        # Alert when XGBoost spikes above threshold or diverges from RF
+        alert_triggered = False
+        alert_msg = None
+        if xgb_base > 0.70:
+            alert_triggered = True
+            alert_msg = f"XGBoost detects HIGH risk ({xgb_base:.2f}) at t-{h}h — immediate review"
+        elif abs(xgb_base - rf_base) > 0.20:
+            alert_triggered = True
+            alert_msg = f"Model divergence detected at t-{h}h (RF={rf_base:.2f}, XGB={xgb_base:.2f})"
+
+        point = {
+            "timestamp": f"-{h}h",
+            "rf_risk_score": round(rf_base, 4),
+            "xgb_risk_score": round(xgb_base, 4),
+            "ensemble_score": round(ensemble, 4),
+            "risk_level": level,
+            "alert_triggered": alert_triggered,
+            "alert_message": alert_msg
+        }
+        data_points.append(point)
+        if alert_triggered:
+            alerts.append({"time": f"-{h}h", "message": alert_msg})
+
+    # Compute overall trend from ensemble scores
+    if len(trend_scores) >= 4:
+        first_quarter = sum(trend_scores[:len(trend_scores)//4]) / (len(trend_scores)//4)
+        last_quarter = sum(trend_scores[-(len(trend_scores)//4):]) / (len(trend_scores)//4)
+        diff = last_quarter - first_quarter
+        if diff > 0.05:
+            trend = "declining"
+        elif diff < -0.05:
+            trend = "improving"
+        else:
+            trend = "stable"
+    else:
+        trend = "stable"
+
     return {
         "patient_id": patient_id,
         "period": f"last {hours} hours",
-        "data": {
-            "timestamps": timestamps,
-            "risk_scores": risk_scores,
-            "trend": "stable"
-        }
+        "total_data_points": len(data_points),
+        "trend": trend,
+        "total_alerts": len(alerts),
+        "alerts": alerts,
+        "monitoring_summary": {
+            "rf_model": "Used for stable hourly trend analysis",
+            "xgb_model": "Used for real-time anomaly/spike detection",
+            "ensemble": "Weighted combination (40% RF + 60% XGB)"
+        },
+        "data": data_points
     }
 
 
